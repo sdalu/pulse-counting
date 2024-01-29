@@ -23,6 +23,7 @@
 #include <getopt.h>
 
 
+/* Infered from: uapi/linux/gpio.h */
 #define MAX_EVENTS ((GPIO_V2_LINES_MAX) * 16)
 
 
@@ -30,49 +31,15 @@
  * Raspberry PI GPIO defintions                                         *
  ************************************************************************/
 
+/* RPI gpio chipset */
 #define RPI_GPIO_CHIP		"gpiochip0"
 
-#undef  RPI_P1_1		// Power: 3.3v
-#undef  RPI_P1_2		// Power: 5v
-#define RPI_P1_3		2
-#undef  RPI_P1_4		// Power: 5v
-#define RPI_P1_5		3
-#undef  RPI_P1_6		// Ground
-#define RPI_P1_7		4
-#define RPI_P1_8		14
-#undef  RPI_P1_9		// Ground
-#define RPI_P1_10		15
-#define RPI_P1_11		17
-#define RPI_P1_12		18
-#define RPI_P1_13		27
-#undef  RPI_P1_14		// Ground
-#define RPI_P1_15		22
-#define RPI_P1_16		23
-#undef  RPI_P1_17		// Power: 3.3v
-#define RPI_P1_18		24
-#define RPI_P1_19		10
-#undef  RPI_P1_20		// Ground
-#define RPI_P1_21		9
-#define RPI_P1_22		25
-#define RPI_P1_23		11
-#define RPI_P1_24		8
-#undef  RPI_P1_25		// Ground
-#define RPI_P1_26		7
-#define RPI_P1_27		0
-#define RPI_P1_28		1
-#define RPI_P1_29		5
-#undef  RPI_P1_30		// Ground
-#define RPI_P1_31		6
-#define RPI_P1_32		12
-#define RPI_P1_33		13
-#undef  RPI_P1_34		// Ground
-#define RPI_P1_35		19
-#define RPI_P1_36		16
-#define RPI_P1_37		26
-#define RPI_P1_38		20
-#undef  RPI_P1_39		// Ground
-#define RPI_P1_40		21
-
+/* RPI pin mapping (-1 are power or ground pin) */
+static int rpi_pinmap[] = {
+    -1, -1,  2, -1,  3, -1,  4, 14, -1, 15,
+    17, 18, 27, -1, 22, 23, -1, 24, 10, -1,
+     9, 25, 11,  8, -1,  7,  0,  1,  5, -1,
+     6, 12, 13, -1, 19, 16, 26, 20, -1, 21 };
 
 
 /************************************************************************
@@ -131,26 +98,24 @@
     } while(0)
 
 
-
-
 struct config {
-    int events_wanted;
-    struct {
-	uint8_t debounce    :1;
-	uint8_t idle_timeout:1;
+    struct {                     // Controller
+	char    *id;             //  - identifier
+	int      fd;             //  - file descriptor
+    } ctrl;
+    struct {                     // Pin
+	uint32_t id;             //  - identifier
+	int      fd;             //  - file descriptor
+	uint64_t flags;          //  - flags
+	char    *label;          //  - label
+    } pin;
+    struct {                     // Flags
+	uint8_t debounce    :1;  //   - debounce
+	uint8_t idle_timeout:1;  //   - idel timeout
     } flags;
-    uint32_t debounce;
-    uint64_t idle_timeout;
-    char *ctrl_id;
-    int   pin_id;
-    uint64_t pin_flags;
-    char *label;
+    uint32_t debounce;           // debounce time in µs
+    uint64_t idle_timeout;       // idle timeout in µs
 };
-
-
-/************************************************************************
- *                                                                      *
- ************************************************************************/
 
 static int
 parse_period(const char *option, uint64_t *val)
@@ -242,9 +207,39 @@ parse_bias(const char *option, uint64_t *flags)
     return 0;
 }
 
-
-
 static int
+parse_gpio(const char *option, char **chip_id, uint32_t *pin_id)
+{
+    char *sep = strchr(option, ':');
+    if (sep == NULL) return -1;
+
+    char *_chip_id = strndup(option, sep - option);
+    if (_chip_id == NULL) return -1;
+    
+    char   * endptr   = NULL;
+    char   * number   = sep + 1;
+    uint32_t _pin_id  = strtoul(number, &endptr, 10);
+
+    if ((number[0] == '\0') || (endptr[0] != '\0'))
+	goto failed;
+
+    if (strcmp(_chip_id, "rpi") == 0) {
+	free(_chip_id);
+	_chip_id = strdup(RPI_GPIO_CHIP);
+	if (_chip_id == NULL) return -1;
+	if ((_pin_id < 1) || (_pin_id > 40)) return -1;
+	if (rpi_pinmap[_pin_id - 1] < 0) return -1;
+	_pin_id = rpi_pinmap[_pin_id - 1];
+    }
+
+    return 0;
+    
+ failed:
+    free(_chip_id);
+    return -1;
+}
+
+static void
 parse_config(int argc, char **argv, struct config *cfg)
 {
     static const char *const shortopts = "+L:D:I:b:e:h";
@@ -268,7 +263,7 @@ parse_config(int argc, char **argv, struct config *cfg)
 	
 	switch (optc) {
 	case 'L':
-	    cfg->label = optarg;
+	    cfg->pin.label = optarg;
 	    break;
 	case 'D':
 	    if (parse_debounce(optarg, &cfg->debounce) < 0)
@@ -281,13 +276,16 @@ parse_config(int argc, char **argv, struct config *cfg)
 	    cfg->flags.idle_timeout = 1;
 	    break;
 	case 'e':
-	    if (parse_edge(optarg, &cfg->pin_flags) < 0)
+	    if (parse_edge(optarg, &cfg->pin.flags) < 0)
 		USAGE_DIE("invalid edge (rising, failing)");
 	    break;
 	case 'b':
-	    if (parse_bias(optarg, &cfg->pin_flags) < 0)
+	    if (parse_bias(optarg, &cfg->pin.flags) < 0)
 		USAGE_DIE("invalid bias (as-is, disabled, pull-up, pull-down)");
 	    break;
+	case 'h':
+	    printf("pulse-counting [opts] chipset:pin\n");
+	    exit(0);
 	case 0:
 	    break;
 	default:
@@ -295,30 +293,21 @@ parse_config(int argc, char **argv, struct config *cfg)
 	}
     }
 
-    
-    return optind;
+
+    argc -= optind;
+    argv += optind;
+
+    if (argc != 1)
+	USAGE_DIE("missing GPIO pin (chipset:pin)");
+
+    if (parse_gpio(argv[0], &cfg->ctrl.id, &cfg->pin.id) < 0)
+	USAGE_DIE("invalid GPIO pin (chipset:pin)");
 }
 
 
 /************************************************************************
  *                                                                      *
  ************************************************************************/
-
-
-struct pulse_counting {
-    int ctrl_fd;
-    int pin_fd;
-    
-};
-
-static struct pulse_counting pulse_counting = { 0 };
-
-static struct config config = {
-    .ctrl_id = RPI_GPIO_CHIP,
-    .pin_id  = RPI_P1_37,
-    .label   = "pulse-counting",
-};
-
 
 static void
 reduced_lattency(void)
@@ -333,24 +322,34 @@ reduced_lattency(void)
     mlockall(MCL_CURRENT | MCL_FUTURE);
 }
 
+
+/************************************************************************
+ *                                                                      *
+ ************************************************************************/
+
+static struct config config = {
+    .ctrl.id   = "n/a",
+    .ctrl.fd   = -1,
+    .pin.id    = ~0,
+    .pin.fd    = -1,
+    .pin.flags = GPIO_V2_LINE_FLAG_EDGE_RISING,
+    .pin.label = "pulse-counting",
+};
+
+
+
 int main(int argc, char *argv[])
 {
-    int                       rc      = -EINVAL;
-    int                       fd      = -1;
-    char                     *devpath = NULL;
-    struct pulse_counting    *pc      = &pulse_counting;
+    int                     rc      = -EINVAL;
+    int                     fd      = -1;
+    char                   *devpath = NULL;
+    struct config          *cfg     = &config;
 
-
-    struct config *cfg = &config;
-
-    
-    int i = parse_config(argc, argv, cfg);
-    argc -= i;
-    argv += i;
-
+    // Configuration
+    parse_config(argc, argv, cfg);
     
     // Build device path
-    rc = asprintf(&devpath, "/dev/%s", cfg->ctrl_id);
+    rc = asprintf(&devpath, "/dev/%s", cfg->ctrl.id);
     if (rc < 0) {
 	errno = ENOMEM;
 	LOG_ERRNO("unable to build path to device name");
@@ -368,8 +367,8 @@ int main(int argc, char *argv[])
     // Get line (with a single gpio)
     struct gpio_v2_line_request req = {
 	.num_lines        = 1,
-	.offsets          = { [0] = cfg->pin_id },
-	.config.flags     = GPIO_V2_LINE_FLAG_INPUT | cfg->pin_flags,
+	.offsets          = { [0] = cfg->pin.id },
+	.config.flags     = GPIO_V2_LINE_FLAG_INPUT | cfg->pin.flags,
 	.config.num_attrs = cfg->flags.debounce ? 1 : 0,
 	.config.attrs     = {
 	    { .mask                    = 1 << 0,
@@ -377,26 +376,26 @@ int main(int argc, char *argv[])
 	      .attr.debounce_period_us = cfg->debounce                  }
 	}
     };
-    strncpy(req.consumer, cfg->label, sizeof(req.consumer));
+    strncpy(req.consumer, cfg->pin.label, sizeof(req.consumer));
     
     // Release memory
     free(devpath);
 
     // Save controller file descriptor
-    pc->ctrl_fd = fd;
+    cfg->ctrl.fd = fd;
 
     // Call ioctl
-    rc = ioctl(pc->ctrl_fd, GPIO_V2_GET_LINE_IOCTL, &req);
+    rc = ioctl(cfg->ctrl.fd, GPIO_V2_GET_LINE_IOCTL, &req);
     if (rc < 0) {
 	LOG_ERRNO("failed to issue GPIO_V2_GET_LINE IOCTL for pin %d",
-		  cfg->pin_id);
+		  cfg->pin.id);
 	return -errno;
     }
     
     // Store file descriptor
-    pc->pin_fd = req.fd;
+    cfg->pin.fd = req.fd;
     LOG("GPIO line configured as single pin %d (fd=%d)",
-	cfg->pin_id, pc->pin_fd);
+	cfg->pin.id, cfg->pin.fd);
 
     // Reduce latency
     reduced_lattency();
@@ -410,7 +409,7 @@ int main(int argc, char *argv[])
 		.tv_nsec = cfg->idle_timeout % 1000000 * 1000,
 	    };
 	    struct pollfd pfd = {
-		.fd     = pc->pin_fd,
+		.fd     = cfg->pin.fd,
 		.events = POLLIN | POLLPRI
 	    };
 	    int rc = ppoll(&pfd, 1, &ts, NULL);
@@ -424,7 +423,7 @@ int main(int argc, char *argv[])
 	}
 
 	struct gpio_v2_line_event event[MAX_EVENTS];
-	ssize_t size = read(pc->pin_fd, event, sizeof(event));
+	ssize_t size = read(cfg->pin.fd, event, sizeof(event));
 	    
 	if (size < 0) {
 	    LOG_ERRNO("failed to read event");
@@ -437,11 +436,8 @@ int main(int argc, char *argv[])
 	struct timespec ts;
 	clock_gettime(CLOCK_TAI, &ts);
 	
-	PUT("%d", size / sizeof(struct gpio_v2_line_event));
-	
+	PUT("pulse -> %d", size / sizeof(struct gpio_v2_line_event));	
     }
-    
-
     
     // Deal with failures
  failed:
